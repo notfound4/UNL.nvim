@@ -19,7 +19,7 @@ local M = {
     },
     checker_picker = {
       mode = "auto",
-      prefer = { "snacks" },
+      prefer = { "telescope", "snacks" },
     },
     filer = {
       mode = "auto",
