@@ -58,6 +58,12 @@ function M.run(spec)
   local fzf_opts = {
     prompt = spec.title or "Select Item> ",
     cwd = spec.cwd or vim.loop.cwd(),
+    fzf_opts = { ["--multi"] = true },
+    keymap = {
+      fzf = {
+        ["load"] = "select-all",
+      },
+    },
     -- FzfLuaはデフォルトでマルチ選択が可能だが、呼び出し元の意図に合わせて制御したい場合はここで行う
     -- (fzf-luaのAPI仕様上、完全にシングルモードにするオプションはないが、header等で案内は可能)
     actions = {

@@ -32,11 +32,11 @@ function M.run_with_fallback(opts)
   local log = logging.get(opts.logger_name or "UNL")
 
   -- ▼▼▼ ここからが新しいロジック ▼▼▼
-  
+
   -- 1. 設定オブジェクトを取得
   local conf = opts.conf or {}
   local mode = conf.mode or "auto"
-  
+
   -- 2. mode に基づいて、試行するプロバイダーのリストを構築
   local prefer_chain = {}
   if mode == "auto" then
@@ -52,18 +52,23 @@ function M.run_with_fallback(opts)
   -- 3. 構築したリストを元に、フォールバックを実行 (このループ自体は変更なし)
   for _, provider_name in ipairs(prefer_chain) do
     local provider = opts.registry.get(provider_name)
-    
+
     if provider and provider.available and provider.available() then
       log.debug("%s: Attempting to use provider '%s'...", opts.picker_type_name, provider_name)
-      
+
       local ok, err = pcall(provider.run, opts.spec)
-      
+
       if ok then
         log.debug("%s: Provider '%s' executed successfully.", opts.picker_type_name, provider_name)
         success = true
         break
       else
-        log.warn("%s: Provider '%s' failed to run, trying next. Reason: %s", opts.picker_type_name, provider_name, tostring(err))
+        log.warn(
+          "%s: Provider '%s' failed to run, trying next. Reason: %s",
+          opts.picker_type_name,
+          provider_name,
+          tostring(err)
+        )
       end
     end
   end

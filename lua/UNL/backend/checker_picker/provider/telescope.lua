@@ -102,23 +102,14 @@ function M.run(spec)
           return entry and entry.value or nil
         end
 
-        if spec.multi_select then
-          local results = {}
-          for _, entry in ipairs(picker:get_multi_selection()) do
-            table.insert(results, get_value(entry))
-          end
-          if spec.on_submit then
-            vim.schedule(function()
-              spec.on_submit(results)
-            end)
-          end
-        else
-          local selection = action_state.get_selected_entry()
-          if spec.on_submit then
-            vim.schedule(function()
-              spec.on_submit(get_value(selection))
-            end)
-          end
+        local results = {}
+        for _, entry in ipairs(picker:get_multi_selection()) do
+          table.insert(results, get_value(entry))
+        end
+        if spec.on_submit then
+          vim.schedule(function()
+            spec.on_submit(results)
+          end)
         end
       end)
       return true

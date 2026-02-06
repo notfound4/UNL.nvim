@@ -6,11 +6,10 @@ local unl_picker_factory = require("UNL.backend.factory.picker")
 
 -- (変更) native プロバイダーもリストに含まれていることを確認
 local provider_modules = {
-  -- "UNL.backend.checker_picker.provider.telescope",
-  -- "UNL.backend.checker_picker.provider.fzf_lua",
+  "UNL.backend.checker_picker.provider.telescope",
+  "UNL.backend.checker_picker.provider.fzf_lua",
   "UNL.backend.checker_picker.provider.snacks",
-  -- "UNL.backend.checker_picker.provider.native",
-  -- "UNL.backend.checker_picker.provider.dummy",
+  "UNL.backend.checker_picker.provider.dummy",
 }
 
 local M = {}

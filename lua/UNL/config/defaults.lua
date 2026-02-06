@@ -19,7 +19,7 @@ local M = {
     },
     checker_picker = {
       mode = "auto",
-      prefer = { "telescope", "snacks" },
+      prefer = { "telescope", "fzf-lua", "snacks" },
     },
     filer = {
       mode = "auto",
