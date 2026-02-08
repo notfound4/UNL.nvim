@@ -1425,7 +1425,10 @@ pub fn process_query(conn: &Connection, req: QueryRequest) -> anyhow::Result<Val
                              QueryRequest::SearchFilesInModulesAsync { .. } |
                              QueryRequest::GetClassesInModulesAsync { .. } => {
                                  Err(anyhow::anyhow!("Async queries must be processed via process_query_streaming"))
-                             }
+                             },
+        QueryRequest::GetCompletions { content, line, character, file_path } => {
+            crate::completion::process_completion(conn, &content, line, character, file_path)
+        }
                          }
                      }
                      

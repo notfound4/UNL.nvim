@@ -215,4 +215,13 @@ function M.get_project_items(opts, callback)
     end)
 end
 
+--- サーバーサイド補完候補取得
+function M.get_completions(opts, callback)
+    local content = opts.content
+    local line = opts.line
+    local character = opts.character
+    local file_path = opts.file_path
+    remote.get_completions(content, line, character, file_path, callback)
+end
+
 return M

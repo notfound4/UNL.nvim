@@ -269,4 +269,13 @@ function M.get_all_file_paths(cb)
     M.request("GetAllFilePaths", {}, cb)
 end
 
+function M.get_completions(content, line, character, file_path, cb)
+    M.request("GetCompletions", {
+        content = content,
+        line = line,
+        character = character,
+        file_path = file_path
+    }, cb)
+end
+
 return M

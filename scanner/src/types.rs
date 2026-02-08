@@ -215,6 +215,12 @@ pub enum QueryRequest {
     GetTargetFiles,
     GetAllFilePaths,
     GetAllFilesMetadata,
+    GetCompletions {
+        content: String,
+        line: u32,
+        character: u32,
+        file_path: Option<String>,
+    },
 }
 
 use std::io::{self, Write};
