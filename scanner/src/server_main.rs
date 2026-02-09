@@ -350,6 +350,13 @@ struct PingRequest { pid: u32 }
 async fn handle_setup(state: &AppState, params: &Value) -> anyhow::Result<Value> {
     let req: SetupRequest = convert_params(params)?;
     let db_path_native = normalize_to_native(&req.db_path);
+    
+    // Invalidate cached connection if exists
+    {
+        let mut conns = state.connections.lock().unwrap();
+        conns.remove(&db_path_native);
+    }
+
     let root_unix = normalize_to_unix(&req.project_root);
     let root_path_unix = PathBuf::from(&root_unix);
     let db_path_native_clone = db_path_native.clone();
@@ -390,6 +397,15 @@ async fn handle_refresh(state: &AppState, params: &Value, tx: mpsc::Sender<Vec<u
              ctx.db_path.clone()
         } else { return Err(anyhow::anyhow!("Project not found")); }
     };
+    
+    let db_path_native = normalize_to_native(&db_path_unix);
+    
+    // Invalidate cached connection before refresh to ensure we write to the latest file
+    {
+        let mut conns = state.connections.lock().unwrap();
+        conns.remove(&db_path_native);
+    }
+
     req.db_path = Some(db_path_unix.clone());
     let _ = state.save_registry();
     let reporter = Arc::new(RpcProgressReporter { tx });

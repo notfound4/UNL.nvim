@@ -90,6 +90,7 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
 
         let walker = WalkBuilder::new(s_root)
             .hidden(false)
+            .git_ignore(false) // Ensure we don't skip Source/Plugins if ignored by some root rule
             .filter_entry({
                 let excludes = excludes.clone();
                 move |entry| {
@@ -101,9 +102,10 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
             })
             .build();
 
+        let mut root_files_count = 0;
         for entry in walker.filter_map(|e| e.ok()) {
             files_scanned += 1;
-            if files_scanned % 500 == 0 {
+            if files_scanned % 1000 == 0 {
                 reporter.report("discovery", 10, 100, &format!("Discovery: {} files seen...", files_scanned));
             }
 
@@ -129,9 +131,13 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
             // Collect files for scanning in the SAME pass
             if entry.file_type().map_or(false, |t| t.is_file()) && include_exts.contains(&ext.to_lowercase()) {
                 all_discovered_files.push((normalize_path(path), ext.to_lowercase()));
+                root_files_count += 1;
             }
         }
+        tracing::info!("Discovered {} relevant files in root: {:?}", root_files_count, s_root);
     }
+
+    tracing::info!("Total files discovered: {}", all_discovered_files.len());
 
     // Deduplicate components
     let mut unique_components = Vec::new();
@@ -205,10 +211,20 @@ pub fn run_refresh(req: RefreshRequest, reporter: Arc<dyn ProgressReporter>) -> 
 
     // Load existing mtimes to skip unchanged files
     let mut existing_mtimes = HashMap::new();
+    let mut db_is_empty = true;
     {
         let mut stmt = conn.prepare("SELECT path, mtime FROM files")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
-        for r in rows { if let Ok((p, m)) = r { existing_mtimes.insert(p, m); } }
+        for r in rows { 
+            if let Ok((p, m)) = r { 
+                existing_mtimes.insert(p, m); 
+                db_is_empty = false;
+            } 
+        }
+    }
+
+    if db_is_empty {
+        tracing::info!("Database is empty. Forcing full scan regardless of requested scope.");
     }
 
     conn.execute("PRAGMA foreign_keys = OFF", [])?;

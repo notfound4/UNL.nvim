@@ -85,17 +85,21 @@ builder.create({
 })
 
 -- Auto-start Server Logic
-vim.api.nvim_create_autocmd({ "VimEnter", "DirChanged" }, {
+vim.api.nvim_create_autocmd({ "VimEnter", "DirChanged", "BufReadPost" }, {
   group = vim.api.nvim_create_augroup("UNL_AutoStart", { clear = true }),
-  callback = function()
+  pattern = { "*", "*.uproject", "*.cpp", "*.h", "*.hpp", "*.cs" },
+  callback = function(args)
+    -- Skip special buffers
+    if vim.bo[args.buf].buftype ~= "" then return end
+
     local ok_conf, conf = pcall(function() return require("UNL.config").get("UNL") end)
     if ok_conf and conf.remote and conf.remote.auto_server_start then
       local unl_finder = require("UNL.finder")
-      local project_info = unl_finder.project.find_project(vim.loop.cwd())
+      local project_info = unl_finder.project.find_project(vim.fn.expand("%:p:h"))
+      
       if project_info and project_info.uproject then
-        require("UNL.scanner.server").ensure_running(function(running)
-           -- Optional: Notify or log if started automatically
-        end)
+        -- Execute the full 'start' logic which handles setup/refresh
+        api.start()
       end
     end
   end
