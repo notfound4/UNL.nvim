@@ -1,4 +1,4 @@
--- lua/UNL/cmd/start.lua (Aggressive Notification & Robust Startup)
+-- lua/UNL/cmd/start.lua (Robust Server Startup)
 local setup = require("UNL.cmd.setup")
 local watch = require("UNL.cmd.watch")
 local refresh = require("UNL.cmd.refresh")
@@ -33,7 +33,6 @@ function M.execute(opts)
 
                 if not (project_info and project_info.uproject) then
                     if retries > 0 then
-                        -- vim.notify("UNL: Project not found yet, retrying...", vim.log.levels.DEBUG)
                         retries = retries - 1
                         vim.defer_fn(poll_and_setup, 1000)
                     end
@@ -44,8 +43,6 @@ function M.execute(opts)
                 local project_root_norm = path_util.normalize(project_root)
                 local db_path = path_util.get_db_path(project_root)
                 
-                -- vim.notify("UNL: Project identified: " .. project_root, vim.log.levels.INFO)
-
                 rpc.request("list_projects", {}, nil, function(list_ok, projects)
                     if not list_ok then return end
 
@@ -65,7 +62,7 @@ function M.execute(opts)
                     local db_exists = false
                     if vim.fn.filereadable(db_path) == 1 then
                         local size = vim.fn.getfsize(db_path)
-                        if size > 50000 then -- 50KB以上あれば健全
+                        if size > 50000 then -- Over 50KB considered valid
                             db_exists = true
                         end
                     end
@@ -75,21 +72,23 @@ function M.execute(opts)
                     if is_registered and db_exists then
                         local vcs_changed = (current_vcs ~= last_vcs) and (current_vcs ~= nil)
                         if vcs_changed then
-                             vim.notify("UNL: VCS changed, refreshing...", vim.log.levels.INFO)
+                             log.info("VCS changed for %s. Refreshing...", project_root)
                              refresh.execute(opts)
+                        else
+                             log.debug("UNL Server is ready for project: %s", project_root)
                         end
                         return
                     end
 
                     if is_registered and not db_exists then
-                        vim.notify("UNL: Database missing, starting full refresh...", vim.log.levels.WARN)
+                        log.info("Database missing for %s. Starting full refresh...", project_root)
                         local refresh_opts = vim.tbl_extend("force", opts, { scope = "Full" })
                         refresh.execute(refresh_opts)
                         watch.execute(opts)
                         return
                     end
 
-                    vim.notify("UNL: Initializing project: " .. vim.fn.fnamemodify(project_root, ":t"), vim.log.levels.INFO)
+                    log.info("Registering and initializing project: %s", project_root)
                     setup.execute(opts, function(setup_success)
                         if setup_success then
                             watch.execute(opts)
