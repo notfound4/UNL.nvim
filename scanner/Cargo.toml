@@ -16,7 +16,7 @@ name = "unl-server"
 path = "src/server_main.rs"
 
 [dependencies]
-tree-sitter = "0.25"
+tree-sitter = "0.26.5"
 tree-sitter-unreal-cpp = { git = "https://github.com/taku25/tree-sitter-unreal-cpp", rev = "7bbb85f1fcc6e109c90cea2167e88a5a472910d3" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

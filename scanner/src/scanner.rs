@@ -475,7 +475,7 @@ fn has_child_type(node: Node, type_name: &str) -> bool {
 
 fn find_declarator_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
+        if let Some(child) = node.child(i as u32) {
             let field_name = node.field_name_for_child(i as u32);
             if field_name == Some("declarator") {
                 return Some(child);

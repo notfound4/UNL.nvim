@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use tree_sitter::{Parser, Point, Node};
+use tree_sitter::{Parser, Point, Node, Query, QueryCursor, StreamingIterator};
 use std::collections::HashMap;
 
 // 補完ロジックのメインエントリー
@@ -11,6 +11,7 @@ pub fn process_completion(
     character: u32,
     _file_path: Option<String>,
 ) -> anyhow::Result<Value> {
+    tracing::info!("--- Completion Request at {}:{} ---", line, character);
     let mut parser = Parser::new();
     let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
     parser.set_language(&language)?;
@@ -18,62 +19,63 @@ pub fn process_completion(
     let tree = parser.parse(content, None).ok_or_else(|| anyhow::anyhow!("Failed to parse content"))?;
     let root = tree.root_node();
     
-    // カーソル位置 (row, col)
-    // 補完のリクエストは、通常ドットやアローの直後に来る
-    // 例: "obj.|" -> cursor is after dot
-    // 前の文字を確認するために、行を取得する必要があるが、tree-sitterのみで解決を試みる
-    
     let row = line as usize;
     let col = character as usize;
     
-    // カーソル位置の直前のノードを取得したい
-    // descendant_for_point_range は範囲内のノードを返すが、
-    // "obj." の直後の場合、dot node か、あるいは次の空ノードになる可能性がある
+    // カーソル位置とその直前を含むノードを探す (0.26.5 API)
+    let point = Point::new(row, col);
+    let prev_point = Point::new(row, if col > 0 { col - 1 } else { 0 });
     
-    let point = Point::new(row, if col > 0 { col - 1 } else { 0 });
-    let node = root.descendant_for_point_range(point, point);
+    let node = match root.descendant_for_point_range(prev_point, point) {
+        Some(n) => n,
+        None => return Ok(json!([])),
+    };
 
-    if let Some(n) = node {
-        // ドットまたはアロー演算子かどうかチェック
-        let node_type = n.kind();
-        if node_type == "." || node_type == "->" || node_type == "::" {
-            // 左側の式を取得 (field_expression の object)
-            // field_expression ( . or -> )
-            // qualified_identifier ( :: )
-            
-            if let Some(parent) = n.parent() {
-                let p_kind = parent.kind();
-                if p_kind == "field_expression" {
-                    if let Some(obj_node) = parent.child_by_field_name("argument") {
-                        let var_name = obj_node.utf8_text(content.as_bytes())?;
-                        return resolve_and_fetch_members(conn, var_name, &root, content, row, node_type == "->");
-                    }
-                } else if p_kind == "qualified_identifier" {
-                    if let Some(scope_node) = parent.child_by_field_name("scope") {
-                        let scope_name = scope_node.utf8_text(content.as_bytes())?;
-                        return resolve_static_members(conn, scope_name);
+    let node_type = node.kind();
+    tracing::info!("Node at cursor: kind='{}', text='{}'", node_type, get_node_text(&node, content));
+    
+    // 1. 演算子（. -> ::）の直後の場合 (obj->|)
+    if node_type == "." || node_type == "->" || node_type == "::" {
+        if let Some(prev) = get_prev_meaningful_sibling(node) {
+            tracing::info!("Operator detected, target node: kind='{}'", prev.kind());
+            return resolve_node_and_fetch_members(conn, prev, &root, content, row);
+        }
+    }
+
+    // 2. 識別子の入力途中、またはそれ以外
+    let mut curr_opt = Some(node);
+    while let Some(curr) = curr_opt {
+        let p_kind = curr.kind();
+        if p_kind == "field_expression" {
+            if let Some(obj_node) = curr.child_by_field_name("argument") {
+                return resolve_node_and_fetch_members(conn, obj_node, &root, content, row);
+            }
+            break;
+        } else if p_kind == "qualified_identifier" {
+            if let Some(scope_node) = curr.child_by_field_name("scope") {
+                return resolve_static_members(conn, get_node_text(&scope_node, content));
+            }
+            break;
+        } else if p_kind == "ERROR" {
+            if let Some(prev_op) = get_prev_meaningful_sibling(curr) {
+                let op_kind = prev_op.kind();
+                if op_kind == "." || op_kind == "->" || op_kind == "::" {
+                    if let Some(obj_node) = get_prev_meaningful_sibling(prev_op) {
+                        return resolve_node_and_fetch_members(conn, obj_node, &root, content, row);
                     }
                 }
             }
-        } else {
-            // カーソルが識別子の上にある場合 (入力途中: "obj.Me|")
-            // 親を辿って field_expression を探す
-            let mut parent = n.parent();
-            while let Some(p) = parent {
-                if p.kind() == "field_expression" {
-                    if let Some(obj_node) = p.child_by_field_name("argument") {
-                        let var_name = obj_node.utf8_text(content.as_bytes())?;
-                        return resolve_and_fetch_members(conn, var_name, &root, content, row, false); // is_arrow判定は簡易
-                    }
-                    break;
-                } else if p.kind() == "qualified_identifier" {
-                    if let Some(scope_node) = p.child_by_field_name("scope") {
-                        let scope_name = scope_node.utf8_text(content.as_bytes())?;
-                        return resolve_static_members(conn, scope_name);
-                    }
-                    break;
-                }
-                parent = p.parent();
+        }
+        curr_opt = curr.parent();
+    }
+
+    // 3. 暗黙の this 補完 (スタンドアロンの識別子入力時)
+    if node_type == "identifier" || node_type == "type_identifier" || node_type == "field_identifier" || node_type == "this" {
+        if let Some(current_class) = get_enclosing_class_name(&node, content) {
+            tracing::info!("Implicit 'this' context detected: '{}'", current_class);
+            let members = fetch_members_recursive(conn, &current_class)?;
+            if !members.is_empty() {
+                return Ok(json!(members));
             }
         }
     }
@@ -81,131 +83,382 @@ pub fn process_completion(
     Ok(json!([]))
 }
 
-fn resolve_and_fetch_members(
+fn get_node_text<'a>(node: &Node, content: &'a str) -> &'a str {
+    let range = node.byte_range();
+    if range.end <= content.len() {
+        &content[range.start..range.end]
+    } else {
+        ""
+    }
+}
+
+fn get_prev_meaningful_sibling(node: Node) -> Option<Node> {
+    let mut curr = node.prev_sibling();
+    while let Some(n) = curr {
+        let kind = n.kind();
+        if kind != "comment" && kind != " " && kind != "\n" && kind != "\r" {
+            return Some(n);
+        }
+        curr = n.prev_sibling();
+    }
+    None
+}
+
+fn resolve_node_and_fetch_members(
     conn: &Connection,
-    var_name: &str,
+    node: Node,
     root: &Node,
     content: &str,
     cursor_row: usize,
-    _is_arrow: bool,
 ) -> anyhow::Result<Value> {
-    // 1. 変数の型を推論
-    let type_name = infer_variable_type(var_name, root, content, cursor_row)?;
-    
-    if let Some(mut t_name) = type_name {
-        // 2. typedef 解決 (再帰的に行うべきだが、1段階だけやる)
-        // FTransform -> UE::Math::TTransform
-        t_name = resolve_typedef(conn, &t_name)?;
+    if let Some(t_name) = resolve_expression_type(conn, node, root, content, cursor_row)? {
+        let resolved = resolve_typedef(conn, &t_name)?;
+        tracing::info!("Final type for member lookup: '{}'", resolved);
         
-        // 3. メンバ取得
-        // struct/class の区別なく検索
-        let members = fetch_members_recursive(conn, &t_name)?;
+        let members = fetch_members_recursive(conn, &resolved)?;
         return Ok(json!(members));
     }
-
     Ok(json!([]))
 }
 
-fn resolve_static_members(conn: &Connection, scope_name: &str) -> anyhow::Result<Value> {
-    // 1. typedef 解決
-    let t_name = resolve_typedef(conn, scope_name)?;
+fn resolve_expression_type(
+    conn: &Connection,
+    node: Node,
+    root: &Node,
+    content: &str,
+    cursor_row: usize,
+) -> anyhow::Result<Option<String>> {
+    let kind = node.kind();
+    tracing::info!("resolve_expression_type(kind='{}', text='{}')", kind, get_node_text(&node, content));
+
+    match kind {
+        "this" => {
+            let cls = get_enclosing_class_name(&node, content);
+            tracing::info!("Resolved 'this' to class: {:?}", cls);
+            Ok(cls)
+        }
+        "identifier" | "type_identifier" | "field_identifier" => {
+            let name = get_node_text(&node, content).trim();
+            if name.is_empty() { return Ok(None); }
+            if name == "this" {
+                return Ok(get_enclosing_class_name(&node, content));
+            }
+            if let Some(t) = infer_variable_type(name, root, content, cursor_row)? {
+                return Ok(Some(t));
+            }
+            if let Some(current_class) = get_enclosing_class_name(&node, content) {
+                tracing::info!("Checking if '{}' is a member variable of '{}'", name, current_class);
+                return find_member_return_type(conn, &current_class, name);
+            }
+            Ok(None)
+        }
+        "call_expression" => {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                if func_node.kind() == "field_expression" {
+                    if let Some(obj_node) = func_node.child_by_field_name("argument") {
+                        if let Some(obj_type) = resolve_expression_type(conn, obj_node, root, content, cursor_row)? {
+                            if let Some(field_node) = func_node.child_by_field_name("field") {
+                                return find_member_return_type(conn, &obj_type, get_node_text(&field_node, content).trim());
+                            }
+                        }
+                    }
+                } else {
+                    let func_name = get_node_text(&func_node, content).trim();
+                    if let Some(current_class) = get_enclosing_class_name(&node, content) {
+                        return find_member_return_type(conn, &current_class, func_name);
+                    }
+                }
+            }
+            Ok(None)
+        }
+        "field_expression" => {
+            if let Some(obj_node) = node.child_by_field_name("argument") {
+                if let Some(obj_type) = resolve_expression_type(conn, obj_node, root, content, cursor_row)? {
+                    if let Some(field_node) = node.child_by_field_name("field") {
+                        return find_member_return_type(conn, &obj_type, get_node_text(&field_node, content).trim());
+                    }
+                }
+            }
+            Ok(None)
+        }
+        _ => Ok(None)
+    }
+}
+
+fn find_member_return_type(conn: &Connection, class_name: &str, member_name: &str) -> anyhow::Result<Option<String>> {
+    let clean_class = extract_clean_type(class_name);
+    let resolved_class = resolve_typedef(conn, &clean_class)?;
+    tracing::info!("Searching member '{}' in class '{}' (and parents)", member_name, resolved_class);
     
-    // 2. 静的メンバとEnum値を取得
-    let members = fetch_members_recursive(conn, &t_name)?;
-    // TODO: フィルタリング (is_static == 1 or enum_item)
-    
-    Ok(json!(members))
+    let mut queue = vec![resolved_class];
+    let mut visited = HashMap::new();
+    while let Some(cls) = queue.pop() {
+        if visited.contains_key(&cls) { continue; }
+        visited.insert(cls.clone(), true);
+        
+        let mut stmt = conn.prepare("
+            SELECT m.return_type FROM members m JOIN classes c ON m.class_id = c.id 
+            WHERE c.name = ? AND m.name = ? 
+            ORDER BY (CASE WHEN m.return_type = 'T' OR m.return_type = 'T*' OR m.return_type = 'void' THEN 1 ELSE 0 END) ASC, length(m.return_type) DESC 
+            LIMIT 1
+        ")?;
+        let mut rows = stmt.query([&cls, member_name])?;
+        if let Some(row) = rows.next()? {
+            if let Some(rt) = row.get::<_, Option<String>>(0)? {
+                let cleaned = extract_clean_type(&rt);
+                tracing::info!("Found member '{}' -> '{}' in '{}'", member_name, cleaned, cls);
+                return Ok(Some(cleaned));
+            }
+        }
+        
+        let mut p_stmt = conn.prepare("SELECT parent_name FROM inheritance i JOIN classes c ON i.child_id = c.id WHERE c.name = ?")?;
+        let p_rows = p_stmt.query_map([&cls], |r| Ok(r.get::<_, String>(0)?))?;
+        for p in p_rows { queue.push(p?); }
+    }
+    Ok(None)
+}
+
+fn get_enclosing_class_name(start_node: &Node, content: &str) -> Option<String> {
+    let mut curr_opt = Some(*start_node);
+    while let Some(curr) = curr_opt {
+        let kind = curr.kind();
+        if kind == "class_specifier" || kind == "struct_specifier" || 
+           kind == "unreal_class_declaration" || kind == "unreal_struct_declaration" {
+            if let Some(name_node) = curr.child_by_field_name("name") {
+                let name = get_node_text(&name_node, content).trim().to_string();
+                tracing::info!("Enclosing class found via specifier: '{}'", name);
+                return Some(name);
+            }
+        } else if kind == "function_definition" {
+            if let Some(decl) = curr.child_by_field_name("declarator") {
+                if let Some(qualified) = find_qualified_identifier(decl) {
+                    if let Some(scope) = qualified.child_by_field_name("scope") {
+                        let text = get_node_text(&scope, content).trim().trim_end_matches("::");
+                        let clean = extract_clean_type(text);
+                        tracing::info!("Enclosing class found via qualified method: '{}'", clean);
+                        return Some(clean);
+                    }
+                }
+            }
+        }
+        curr_opt = curr.parent();
+    }
+    None
+}
+
+fn find_qualified_identifier(node: Node) -> Option<Node> {
+    if node.kind() == "qualified_identifier" { return Some(node); }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            if let Some(res) = find_qualified_identifier(child) { return Some(res); }
+        }
+    }
+    None
 }
 
 fn resolve_typedef(conn: &Connection, type_name: &str) -> anyhow::Result<String> {
-    let mut stmt = conn.prepare("SELECT base_class FROM classes WHERE name = ? AND symbol_type = 'typedef' LIMIT 1")?;
-    let mut rows = stmt.query([type_name])?;
-    
-    if let Some(row) = rows.next()? {
-        if let Some(base) = row.get::<_, Option<String>>(0)? {
-            // UE::Math::TTransform<double> -> TTransform を抽出
-            // 簡易的に最後の単語を取得
-            // "UE::Math::TTransform" -> "TTransform"
-            // "TTransform<double>" -> "TTransform"
-            
-            // TODO: もっと真面目なパース
-            if let Some(last_part) = base.split("::").last() {
-                let clean_name = last_part.split('<').next().unwrap_or(last_part);
-                return Ok(clean_name.to_string());
-            }
-        }
+    let mut current = extract_clean_type(type_name);
+    if current.is_empty() || current == "T" || current == "void" { return Ok(current); }
+    for _ in 0..3 {
+        let mut stmt = conn.prepare("SELECT base_class FROM classes WHERE name = ? AND symbol_type = 'typedef' ORDER BY (CASE WHEN base_class IS NOT NULL AND base_class != '' THEN 0 ELSE 1 END) ASC LIMIT 1")?;
+        let mut rows = stmt.query([&current])?;
+        if let Some(row) = rows.next()? {
+            if let Some(base) = row.get::<_, Option<String>>(0)? {
+                let clean = extract_clean_type(&base);
+                if clean == current || clean.is_empty() { break; }
+                current = clean;
+            } else { break; }
+        } else { break; }
     }
-    Ok(type_name.to_string())
+    Ok(current)
+}
+
+fn resolve_static_members(conn: &Connection, scope_name: &str) -> anyhow::Result<Value> {
+    let clean_scope = extract_clean_type(scope_name);
+    let t_name = resolve_typedef(conn, &clean_scope)?;
+    let members = fetch_members_recursive(conn, &t_name)?;
+    Ok(json!(members))
 }
 
 fn fetch_members_recursive(conn: &Connection, class_name: &str) -> anyhow::Result<Vec<Value>> {
-    // query.rs のロジックを再利用したいが、関数分割されていないので再実装するか
-    // query::process_query 内の GetClassMembersRecursive を呼び出せればベスト
-    // ここでは簡易実装
-    
     let mut result = Vec::new();
     let mut queue = vec![class_name.to_string()];
     let mut visited = HashMap::new();
-    
     while let Some(current) = queue.pop() {
         if visited.contains_key(&current) { continue; }
         visited.insert(current.clone(), true);
         
-        // クラスID取得
-        let mut stmt = conn.prepare("SELECT id FROM classes WHERE name = ? LIMIT 1")?;
+        let mut stmt = conn.prepare("SELECT c.id FROM classes c LEFT JOIN members m ON c.id = m.class_id WHERE c.name = ? GROUP BY c.id ORDER BY COUNT(m.id) DESC LIMIT 1")?;
         let mut rows = stmt.query([&current])?;
-        
         if let Some(row) = rows.next()? {
             let class_id: i64 = row.get(0)?;
-            
-            // メンバ取得
-            let mut mem_stmt = conn.prepare(
-                "SELECT name, type, return_type, access, is_static, detail FROM members WHERE class_id = ?"
-            )?;
+            let mut mem_stmt = conn.prepare("SELECT name, type, return_type, access, is_static, detail FROM members WHERE class_id = ?")?;
             let mem_rows = mem_stmt.query_map([class_id], |row| {
-                Ok(json!({
-                    "label": row.get::<_, String>(0)?,
-                    "kind": map_kind(row.get::<_, String>(1)?.as_str()),
-                    "detail": row.get::<_, Option<String>>(2)?, // return_type -> detail
-                    "documentation": row.get::<_, Option<String>>(5)?,
-                    "insertText": row.get::<_, String>(0)?,
-                }))
+                let m_name: String = row.get(0)?;
+                let m_type: String = row.get(1)?;
+                let r_type: Option<String> = row.get(2)?;
+                let detail: Option<String> = row.get(5)?;
+                Ok(json!({ "label": m_name, "kind": map_kind(&m_type), "detail": r_type.unwrap_or_default(), "documentation": detail.unwrap_or_default(), "insertText": m_name }))
             })?;
-            
-            for m in mem_rows {
-                result.push(m?);
-            }
-            
-            // 親クラス取得
+            for m in mem_rows { result.push(m?); }
+            let mut enum_stmt = conn.prepare("SELECT name FROM enum_values WHERE enum_id = ?")?;
+            let enum_rows = enum_stmt.query_map([class_id], |row| {
+                let e_name: String = row.get(0)?;
+                Ok(json!({ "label": e_name, "kind": 20, "detail": "enum item", "insertText": e_name }))
+            })?;
+            for e in enum_rows { result.push(e?); }
             let mut parent_stmt = conn.prepare("SELECT parent_name FROM inheritance WHERE child_id = ?")?;
             let p_rows = parent_stmt.query_map([class_id], |row| Ok(row.get::<_, String>(0)?))?;
-            for p in p_rows {
-                queue.push(p?);
-            }
+            for p in p_rows { queue.push(p?); }
         }
     }
-    
     Ok(result)
 }
 
 fn map_kind(k: &str) -> i64 {
-    match k {
-        "function" => 2, // Method
-        "variable" | "property" => 5, // Field
-        "enum_item" => 20, // EnumMember
-        _ => 1, // Text
-    }
+    match k { "function" => 2, "variable" | "property" => 5, "enum_item" => 20, _ => 1 }
 }
 
-// 簡易型推論 (Luaロジックの移植)
-fn infer_variable_type(_var_name: &str, _root: &Node, _content: &str, _cursor_row: usize) -> anyhow::Result<Option<String>> {
-    // Tree-sitter query to find declaration
-    // 実際にはクエリカーソルを使う必要があるが、ここでは簡易的に実装
-    // "declarator" フィールドを持つノードを探す
-    
-    // TODO: query.rs から QUERY_STR を持ってくるか、ここで定義するか
-    // ここでは単純なスキャンを行う (本当はQueryを使うべき)
-    
-    // 暫定: 常に None (後で実装)
+fn infer_variable_type(target_name: &str, root: &Node, content: &str, cursor_row: usize) -> anyhow::Result<Option<String>> {
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    let query_str = "
+      (declaration type: (_) @type declarator: (_) @decl)
+      (parameter_declaration type: (_) @type declarator: (_) @decl)
+      (for_range_loop type: (_) @type declarator: (_) @decl)
+      (condition_clause (declaration type: (_) @type declarator: (_) @decl))
+    ";
+    let query = Query::new(&language, query_str)?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, *root, content.as_bytes());
+    let mut best_type = None;
+    let mut best_row = 0;
+    while let Some(m) = matches.next() {
+        let mut type_node = None;
+        let mut decl_nodes = Vec::new();
+        for cap in m.captures {
+            let c_name = query.capture_names()[cap.index as usize];
+            if c_name == "type" { type_node = Some(cap.node); }
+            else if c_name == "decl" { decl_nodes.push(cap.node); }
+        }
+        if let Some(t_node) = type_node {
+            for d_node in decl_nodes {
+                if find_identifier_in_decl(&d_node, target_name, content)? {
+                    let row = d_node.start_position().row;
+                    if row <= cursor_row && (best_type.is_none() || row >= best_row) {
+                        let type_text = get_node_text(&t_node, content).trim();
+                        if type_text == "auto" {
+                            if let Some(inferred) = infer_from_assignment(target_name, root, content, cursor_row)? {
+                                best_type = Some(inferred);
+                            }
+                        } else {
+                            best_type = Some(extract_clean_type(type_text));
+                        }
+                        best_row = row;
+                    }
+                }
+            }
+        }
+    }
+    if best_type.is_none() {
+        best_type = infer_from_assignment(target_name, root, content, cursor_row)?;
+    }
+    Ok(best_type)
+}
+
+fn find_identifier_in_decl(node: &Node, target_name: &str, content: &str) -> anyhow::Result<bool> {
+    let kind = node.kind();
+    if kind == "identifier" || kind == "field_identifier" {
+        return Ok(get_node_text(node, content).trim() == target_name);
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            if find_identifier_in_decl(&child, target_name, content)? { return Ok(true); }
+        }
+    }
+    Ok(false)
+}
+
+fn infer_from_assignment(target_name: &str, root: &Node, content: &str, cursor_row: usize) -> anyhow::Result<Option<String>> {
+    let language: tree_sitter::Language = tree_sitter_unreal_cpp::LANGUAGE.into();
+    let query_str = "
+      (declaration declarator: (init_declarator declarator: (_) @decl value: (_) @value))
+      (assignment_expression left: (_) @decl right: (_) @value)
+    ";
+    let query = Query::new(&language, query_str)?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, *root, content.as_bytes());
+    while let Some(m) = matches.next() {
+        let mut decl_node = None;
+        let mut value_node = None;
+        for cap in m.captures {
+            let c_name = query.capture_names()[cap.index as usize];
+            if c_name == "decl" { decl_node = Some(cap.node); }
+            else if c_name == "value" { value_node = Some(cap.node); }
+        }
+        if let (Some(d_node), Some(v_node)) = (decl_node, value_node) {
+            if find_identifier_in_decl(&d_node, target_name, content)? {
+                let row = d_node.start_position().row;
+                if row <= cursor_row { 
+                    let v_text = get_node_text(&v_node, content);
+                    return infer_from_value_text(v_text);
+                }
+            }
+        }
+    }
     Ok(None)
+}
+
+fn infer_from_value_text(text: &str) -> anyhow::Result<Option<String>> {
+    let text = text.trim();
+    if let Ok(re) = regex::Regex::new(r"CreateDefaultSubobject\s*<\s*([a-zA-Z0-9_:]+)") {
+        if let Some(cap) = re.captures(text) { 
+            return Ok(Some(extract_clean_type(cap.get(1).unwrap().as_str())));
+        }
+    }
+    if let Ok(re) = regex::Regex::new(r"([a-zA-Z0-9_]+)\s*<\s*([a-zA-Z0-9_:]+)") {
+        if let Some(cap) = re.captures(text) { 
+            let func = cap.get(1).unwrap().as_str();
+            let inner = cap.get(2).unwrap().as_str();
+            if ["NewObject", "TObjectPtr", "TSharedPtr"].contains(&func) {
+                return Ok(Some(extract_clean_type(inner)));
+            }
+            return Ok(Some(extract_clean_type(func)));
+        }
+    }
+    if let Ok(re) = regex::Regex::new(r"^([a-zA-Z0-9_:]+)\s*\(") {
+        if let Some(cap) = re.captures(text) { return Ok(Some(extract_clean_type(cap.get(1).unwrap().as_str()))); }
+    }
+    Ok(None)
+}
+
+fn extract_clean_type(raw: &str) -> String {
+    let mut clean = raw.trim().to_string();
+    if let Some(start) = clean.find('<') {
+        if let Some(end) = clean.rfind('>') {
+            let wrapper = clean[..start].trim();
+            let inner = &clean[start+1..end];
+            if ["TObjectPtr", "TSharedPtr", "TUniquePtr", "TWeakObjectPtr", "TSubclassOf", "TSoftObjectPtr", "TSoftClassPtr"].contains(&wrapper) {
+                return extract_clean_type(inner);
+            }
+            clean = wrapper.to_string();
+        }
+    }
+    let keywords = ["const", "typename", "struct", "class", "enum", "virtual", "static", "inline", "FORCEINLINE"];
+    for kw in keywords {
+        if let Ok(re) = regex::Regex::new(&format!(r"\b{}\b", kw)) {
+            clean = re.replace_all(&clean, "").to_string();
+        }
+    }
+    if let Ok(re) = regex::Regex::new(r"\b[A-Z0-9_]+_API\b") {
+        clean = re.replace_all(&clean, "").to_string();
+    }
+    clean = clean.replace('*', " ").replace('&', " ");
+    let final_type = clean.split_whitespace()
+        .last()
+        .unwrap_or("")
+        .split("::")
+        .last()
+        .unwrap_or("")
+        .to_string();
+    final_type
 }
