@@ -34,10 +34,16 @@ pub fn process_completion(
     let node_type = node.kind();
     tracing::info!("Node at cursor: kind='{}', text='{}'", node_type, get_node_text(&node, content));
     
-    // 1. 演算子（. -> ::）の直後の場合 (obj->|)
-    if node_type == "." || node_type == "->" || node_type == "::" {
-        if let Some(prev) = get_prev_meaningful_sibling(node) {
-            tracing::info!("Operator detected, target node: kind='{}'", prev.kind());
+    // 1. 演算子（. -> ::）の直後、または演算子そのものの場合
+    if node_type == "." || node_type == "->" || node_type == "::" || node_type == ":" {
+        let op_node = if node_type == ":" {
+            node.parent().filter(|p| p.kind() == "::").unwrap_or(node)
+        } else {
+            node
+        };
+
+        if let Some(prev) = get_prev_meaningful_sibling(op_node) {
+            tracing::info!("Operator detected, target node: kind='{}', text='{}'", prev.kind(), get_node_text(&prev, content));
             return resolve_node_and_fetch_members(conn, prev, &root, content, row);
         }
     }
@@ -57,11 +63,15 @@ pub fn process_completion(
             }
             break;
         } else if p_kind == "ERROR" {
-            if let Some(prev_op) = get_prev_meaningful_sibling(curr) {
-                let op_kind = prev_op.kind();
-                if op_kind == "." || op_kind == "->" || op_kind == "::" {
-                    if let Some(obj_node) = get_prev_meaningful_sibling(prev_op) {
-                        return resolve_node_and_fetch_members(conn, obj_node, &root, content, row);
+            // ERRORノード内の子要素を逆順に探して演算子を見つける
+            let count = curr.child_count();
+            for i in (0..count).rev() {
+                if let Some(child) = curr.child(i as u32) {
+                    let ck = child.kind();
+                    if ck == "." || ck == "->" || ck == "::" {
+                        if let Some(prev) = get_prev_meaningful_sibling(child) {
+                             return resolve_node_and_fetch_members(conn, prev, &root, content, row);
+                        }
                     }
                 }
             }
@@ -137,7 +147,7 @@ fn resolve_expression_type(
             tracing::info!("Resolved 'this' to class: {:?}", cls);
             Ok(cls)
         }
-        "identifier" | "type_identifier" | "field_identifier" => {
+        "identifier" | "type_identifier" | "field_identifier" | "namespace_identifier" | "scoped_type_identifier" => {
             let name = get_node_text(&node, content).trim();
             if name.is_empty() { return Ok(None); }
             if name == "this" {
@@ -148,7 +158,22 @@ fn resolve_expression_type(
             }
             if let Some(current_class) = get_enclosing_class_name(&node, content) {
                 tracing::info!("Checking if '{}' is a member variable of '{}'", name, current_class);
-                return find_member_return_type(conn, &current_class, name);
+                if let Some(rt) = find_member_return_type(conn, &current_class, name)? {
+                    return Ok(Some(rt));
+                }
+            }
+            
+            // Fallback: Check if it's a known type (Class or Enum)
+            if is_known_type(conn, name)? {
+                return Ok(Some(name.to_string()));
+            }
+
+            Ok(None)
+        }
+        "qualified_identifier" => {
+            let text = get_node_text(&node, content);
+            if is_known_type(conn, text)? {
+                return Ok(Some(text.to_string()));
             }
             Ok(None)
         }
@@ -288,7 +313,7 @@ fn fetch_members_recursive(conn: &Connection, class_name: &str) -> anyhow::Resul
         if visited.contains_key(&current) { continue; }
         visited.insert(current.clone(), true);
         
-        let mut stmt = conn.prepare("SELECT c.id FROM classes c LEFT JOIN members m ON c.id = m.class_id WHERE c.name = ? GROUP BY c.id ORDER BY COUNT(m.id) DESC LIMIT 1")?;
+        let mut stmt = conn.prepare("SELECT c.id FROM classes c LEFT JOIN members m ON c.id = m.class_id WHERE LOWER(c.name) = LOWER(?) GROUP BY c.id ORDER BY COUNT(m.id) DESC LIMIT 1")?;
         let mut rows = stmt.query([&current])?;
         if let Some(row) = rows.next()? {
             let class_id: i64 = row.get(0)?;
@@ -317,6 +342,13 @@ fn fetch_members_recursive(conn: &Connection, class_name: &str) -> anyhow::Resul
 
 fn map_kind(k: &str) -> i64 {
     match k { "function" => 2, "variable" | "property" => 5, "enum_item" => 20, _ => 1 }
+}
+
+fn is_known_type(conn: &Connection, name: &str) -> anyhow::Result<bool> {
+    let clean = extract_clean_type(name);
+    if clean.is_empty() { return Ok(false); }
+    let mut stmt = conn.prepare("SELECT 1 FROM classes WHERE LOWER(name) = LOWER(?) LIMIT 1")?;
+    Ok(stmt.exists([&clean])?)
 }
 
 fn infer_variable_type(target_name: &str, root: &Node, content: &str, cursor_row: usize) -> anyhow::Result<Option<String>> {
@@ -437,7 +469,7 @@ fn extract_clean_type(raw: &str) -> String {
         if let Some(end) = clean.rfind('>') {
             let wrapper = clean[..start].trim();
             let inner = &clean[start+1..end];
-            if ["TObjectPtr", "TSharedPtr", "TUniquePtr", "TWeakObjectPtr", "TSubclassOf", "TSoftObjectPtr", "TSoftClassPtr"].contains(&wrapper) {
+            if ["TObjectPtr", "TSharedPtr", "TUniquePtr", "TWeakObjectPtr", "TSubclassOf", "TSoftObjectPtr", "TSoftClassPtr", "TEnumAsByte"].contains(&wrapper) {
                 return extract_clean_type(inner);
             }
             clean = wrapper.to_string();
