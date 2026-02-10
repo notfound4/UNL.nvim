@@ -44,14 +44,17 @@ function M.get_current_hash(root)
     local p4 = get_p4_hash(root)
     if p4 then return p4 end
 
-    -- Git Check
-    if vim.fn.isdirectory(root .. "/.git") == 1 or vim.fn.filereadable(root .. "/.git") == 1 then
+    -- Git Check: .gitディレクトリまたはファイル（submodule等）を上方向に探す
+    local git_dir = vim.fn.finddir(".git", root .. ";")
+    local git_file = vim.fn.findfile(".git", root .. ";")
+    if git_dir ~= "" or git_file ~= "" then
         local git = get_git_hash(root)
         if git then return git end
     end
 
-    -- SVN Check
-    if vim.fn.isdirectory(root .. "/.svn") == 1 then
+    -- SVN Check: .svnディレクトリを上方向に探す
+    local svn_dir = vim.fn.finddir(".svn", root .. ";")
+    if svn_dir ~= "" then
         local svn = get_svn_hash(root)
         if svn then return svn end
     end
