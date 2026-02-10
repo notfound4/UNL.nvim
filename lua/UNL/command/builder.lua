@@ -91,20 +91,34 @@ function M.create(spec)
           end
         else
           -- フラグでなければ、位置引数として扱う
-          local value = positional_args[positional_idx]
-          if value == nil then
-            if arg_def.required then
-              get_logger().error("Missing required argument: '%s'. Usage: %s", arg_def.name, command_def.desc or "")
+          if arg_def.variadic then
+            local values = {}
+            for k = positional_idx, #positional_args do
+              table.insert(values, positional_args[k])
+            end
+            -- 必須チェック: variadicであってもrequiredなら少なくとも1つ必要
+            if arg_def.required and #values == 0 then
+              get_logger().error("Missing required variadic argument: '%s'. Usage: %s", arg_def.name, command_def.desc or "")
               return
             end
-            if type(arg_def.default) == "function" then
-              value = arg_def.default()
-            else
-              value = arg_def.default
+            opts[arg_def.name] = values
+            positional_idx = #positional_args + 1 -- 全て消費
+          else
+            local value = positional_args[positional_idx]
+            if value == nil then
+              if arg_def.required then
+                get_logger().error("Missing required argument: '%s'. Usage: %s", arg_def.name, command_def.desc or "")
+                return
+              end
+              if type(arg_def.default) == "function" then
+                value = arg_def.default()
+              else
+                value = arg_def.default
+              end
             end
+            opts[arg_def.name] = value
+            positional_idx = positional_idx + 1
           end
-          opts[arg_def.name] = value
-          positional_idx = positional_idx + 1
         end
       end
     else
