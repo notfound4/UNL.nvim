@@ -58,13 +58,17 @@ function M.create(spec)
     local opts = { has_bang = has_bang }
     -- ▼▼▼ ここからが修正箇所です ▼▼▼
 
-    -- 2g. ユーザー引数を「位置引数」と「フラグ引数」に分類する
+    -- 2g. ユーザー引数を「位置引数」「フラグ引数」「名前付き引数」に分類する
     local positional_args = {}
     local flag_args = {}
+    local named_args = {}
     for i = 2, #args.fargs do
       local arg = args.fargs[i]
       if arg:sub(1, 2) == "--" then
         table.insert(flag_args, arg)
+      elseif arg:match("^[%w_]+=") then
+        local key, val = arg:match("^([%w_]+)=(.*)$")
+        named_args[key] = val
       else
         table.insert(positional_args, arg)
       end
@@ -77,56 +81,67 @@ function M.create(spec)
         -- specの引数名が "_flag" で終わる場合、フラグとして扱う
         if arg_def.name:match("_flag$") then
           local found = false
-          -- 登録されているフラグ引数の中から一致するものを探す
-          for _, flag in ipairs(flag_args) do
-            -- ここでは単純な完全一致のみを考慮する
-            -- 例: --all-deps, --no-deps
-            opts[arg_def.name] = flag
+          -- 1. 名前付き引数として渡されているか確認 (例: debug_flag=--debug)
+          if named_args[arg_def.name] then
+            opts[arg_def.name] = named_args[arg_def.name]
             found = true
-            break -- 複数フラグがあっても最初のものを使う
+          else
+            -- 2. 登録されているフラグ引数の中から一致するものを探す
+            for _, flag in ipairs(flag_args) do
+              opts[arg_def.name] = flag
+              found = true
+              break
+            end
           end
           if not found and arg_def.required then
             get_logger().error("Missing required flag for argument: '%s'", arg_def.name)
             return
           end
         else
-          -- フラグでなければ、位置引数として扱う
-          if arg_def.variadic then
+          -- フラグでなければ、名前付きまたは位置引数として扱う
+          local value = named_args[arg_def.name]
+          
+          if value ~= nil then
+            -- 名前付き引数が指定された場合
+            if arg_def.variadic then
+              -- variadicならカンマ区切りをテーブルに変換
+              local vals = {}
+              for v in string.gmatch(value, "([^,]+)") do
+                table.insert(vals, v)
+              end
+              opts[arg_def.name] = vals
+            else
+              opts[arg_def.name] = value
+            end
+          elseif arg_def.variadic then
+            -- 位置引数から残り全てを消費
             local values = {}
             for k = positional_idx, #positional_args do
               table.insert(values, positional_args[k])
             end
-            -- 必須チェック: variadicであってもrequiredなら少なくとも1つ必要
             if arg_def.required and #values == 0 then
               get_logger().error("Missing required variadic argument: '%s'. Usage: %s", arg_def.name, command_def.desc or "")
               return
             end
             opts[arg_def.name] = values
-            positional_idx = #positional_args + 1 -- 全て消費
+            positional_idx = #positional_args + 1
           else
-            local value = positional_args[positional_idx]
-            if value == nil then
+            -- 通常の位置引数
+            local val = positional_args[positional_idx]
+            if val == nil then
               if arg_def.required then
                 get_logger().error("Missing required argument: '%s'. Usage: %s", arg_def.name, command_def.desc or "")
                 return
               end
-              if type(arg_def.default) == "function" then
-                value = arg_def.default()
-              else
-                value = arg_def.default
-              end
+              val = (type(arg_def.default) == "function") and arg_def.default() or arg_def.default
             end
-            opts[arg_def.name] = value
+            opts[arg_def.name] = val
             positional_idx = positional_idx + 1
           end
         end
       end
     else
-      local rest_args = {}
-      for i = 2, #args.fargs do
-        table.insert(rest_args, args.fargs[i])
-      end
-      opts.args = rest_args
+      opts.args = { unpack(args.fargs, 2) }
     end
 
     -- ▲▲▲ ここまでが修正箇所です ▲▲▲
